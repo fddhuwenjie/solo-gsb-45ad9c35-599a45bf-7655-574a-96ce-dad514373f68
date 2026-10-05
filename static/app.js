@@ -17,6 +17,14 @@ let panelDirty = true;
 let workspaceRev = 0;      // 当前工作区修订号（GET 响应头 / PUT 响应体维护）
 let currentRelease = null; // 当前发布（GET /api/release）
 let savedNfzs = [];        // 工作区已落库的禁飞区（已有发布时，页面的禁飞区编辑只存草稿）
+let serverRouteSeen = null; // 本页最近一次确认的“服务器航线”（编辑前所见基线）
+let routeConflict = null;   // 双方都改航线时的未解决冲突；非空期间暂停自动保存
+
+// 409 分流后确认“双方都改了航线”：保存中止并抛出本哨兵，
+// 调用方据此知道冲突面板已展示、不得把它当作保存成功继续核准/发布
+class RouteConflictError extends Error {
+  constructor() { super("route conflict"); this.name = "RouteConflictError"; }
+}
 
 // ----------------------------------------------------------- 工具
 const $ = (sel) => document.querySelector(sel);
@@ -30,6 +38,7 @@ const el = (tag, attrs = {}, parent) => {
 };
 const uid = (p) => p + Math.random().toString(36).slice(2, 8);
 const clone = (o) => JSON.parse(JSON.stringify(o));
+const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const num = (v, d = 0) => { const n = parseFloat(v); return Number.isFinite(n) ? n : d; };
 const r2 = (v) => Math.round(v * 100) / 100;
 const fmtTime = (iso) => {
@@ -96,17 +105,142 @@ async function loadState() {
   workspaceRev = parseInt(res.headers.get("X-Workspace-Rev") || "0", 10) || 0;
   applyLoadedState(await res.json());
   savedNfzs = clone(state.nfzs);
+  serverRouteSeen = clone(state.route);
 }
 function flushPendingSave() {
-  // 核准/发布前协调：有待发的航线自动保存时，等它先落库，
-  // 使随后的核准携带最新修订号；没有待发保存则排入队尾（核准本身绝不预存工作区，
-  // 但仍要排在任何在途保存之后，以拿到它返回的最新修订号）
+  // 核准/发布前协调：有待发的航线自动保存（防抖定时器）时，取消定时器并
+  // 立即落库，使随后的核准携带最新修订号；没有待发保存时绝不额外发起 PUT
+  // （核准不预存工作区），只排入队尾等在途请求完成——若在途保存落为未解决
+  // 的航线冲突（routeConflict 被置位），则把冲突向上传播，中止相邻核准/发布
   if (saveTimer !== null) {
     clearTimeout(saveTimer);
     saveTimer = null;
+    if (routeConflict) return Promise.reject(new RouteConflictError());
     return enqueue(() => doSaveState());
   }
-  return enqueue(() => Promise.resolve());
+  return enqueue(() => {
+    if (routeConflict) throw new RouteConflictError();
+  });
+}
+
+// 合入他页已核准的禁飞区基线：本页没有禁飞区草稿（state.nfzs 与旧基线一致）
+// 时直接采用服务器内容；有草稿时只更新基线，画布草稿原样保留，绝不落库草稿
+function adoptServerNfzs(remoteNfzs) {
+  const hadDraft = !sameJson(state.nfzs, savedNfzs);
+  savedNfzs = clone(remoteNfzs);
+  if (!hadDraft) state.nfzs = clone(savedNfzs);
+}
+// 展示双方航线冲突：记录服务器航线/修订号供二选一，暂停自动保存，
+// 本页未保存航线与禁飞区草稿一律保留
+function presentRouteConflict(remoteState, remoteRev) {
+  routeConflict = { route: clone(remoteState.route || {}), rev: remoteRev };
+  workspaceRev = remoteRev;
+  // 合入他页已核准禁飞区基线：本页有草稿则只更新基线（草稿留在画布），
+  // 无草稿则画布一并采用服务器内容，绝不把草稿写库
+  adoptServerNfzs(remoteState.nfzs || []);
+  serverRouteSeen = clone(remoteState.route || {});
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  renderRouteConflict();
+}
+
+async function doSaveState() {
+  // 已有发布时：航线编辑仍自动保存，但禁飞区变更只存草稿，
+  // 落库的禁飞区必须是已核准的 savedNfzs，不得顺带写入草稿内容；
+  // 并携带所见修订号：他页已变更（如别处刚核准）时不得静默覆盖
+  if (!currentRelease) {
+    const payload = state;
+    const res = await apiRaw("/api/state", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const r = await res.json().catch(() => ({}));
+    if (res.ok && r && typeof r.rev === "number") {
+      workspaceRev = r.rev;
+      savedNfzs = clone(state.nfzs); // 未发布：整体落库，镜像同步
+      serverRouteSeen = clone(state.route);
+      routeConflict = null;
+      renderRouteConflict();
+      return;
+    }
+    throw new Error(r && r.error ? r.error : "工作区保存失败");
+  }
+
+  const localRoute = clone(state.route);
+  const localDraft = clone(state.nfzs);
+  const baseRoute = clone(serverRouteSeen);
+  let expectedRev = workspaceRev;
+  let lastErr = null;
+  // 条件写入；409 时取回服务器最新内容，按三种情况分流：
+  //  1) 本页航线相对编辑前所见未改：无本地航线可保存，直接采用服务器最新
+  //     航线与已核准禁飞区（本页禁飞区草稿保留），不再写库；
+  //  2) 本页航线已改、服务器航线仍与编辑前所见一致（差异仅为他页核准的
+  //     禁飞区）：合入已核准禁飞区后用最新修订号重条件写入，草稿不落库；
+  //  3) 双方都改了航线：保留本页编辑，展示双方航线供选择，停止自动重试。
+  // 情况 2 连续多轮 409 最多自动合入重试 2 次，仍冲突则保留编辑并提示。
+  for (let staleRound = 0; staleRound <= 2; staleRound++) {
+    const res = await apiRaw("/api/state", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json",
+                 "X-Expected-Workspace-Rev": String(expectedRev) },
+      body: JSON.stringify({ route: localRoute, nfzs: savedNfzs }),
+    });
+    const r = await res.json().catch(() => ({}));
+    if (res.ok && r && typeof r.rev === "number") {
+      workspaceRev = r.rev;
+      serverRouteSeen = clone(localRoute);
+      routeConflict = null;
+      // 仅在本页这期间未继续编辑时恢复引用，避免抹掉在途编辑
+      if (state.route === localRoute || sameJson(state.route, localRoute)) {
+        state.route = localRoute;
+      }
+      if (sameJson(state.nfzs, localDraft)) state.nfzs = localDraft;
+      if (staleRound > 0) {
+        toast("检测到他页已更新，已合入他页已核准的禁飞区，本页航线已保存");
+        renderPanel(); renderBoard(); runAnalyze();
+      }
+      renderNfzDraft(); renderRouteConflict();
+      return;
+    }
+    if (res.status === 409 && r.reason === "stale") {
+      lastErr = r;
+      const fresh = await fetch("/api/state");
+      const freshRev = parseInt(fresh.headers.get("X-Workspace-Rev") || "0", 10) || expectedRev;
+      const freshState = await fresh.json();
+      const remoteRoute = freshState.route || {};
+      adoptServerNfzs(freshState.nfzs || []); // 任何情况下都先合入已核准禁飞区基线
+      if (sameJson(localRoute, baseRoute)) {
+        // 情况 1：本页航线未改，没有需要保存的本地航线：采用服务器最新航线，
+        // 本页禁飞区草稿已由 adoptServerNfzs 保留
+        workspaceRev = freshRev;
+        serverRouteSeen = clone(remoteRoute);
+        if (state.route === localRoute || sameJson(state.route, localRoute)) {
+          state.route = clone(remoteRoute);
+        }
+        routeConflict = null;
+        toast("检测到他页已保存新航线，已加载服务器最新航线（本页禁飞区草稿保留）");
+        renderRouteConflict(); renderNfzDraft();
+        renderPanel(); renderBoard(); runAnalyze();
+        return;
+      }
+      if (sameJson(remoteRoute, baseRoute)) {
+        // 情况 2：服务器航线仍与本页编辑前所见一致，只有禁飞区在他页获核准
+        expectedRev = freshRev;
+        continue;
+      }
+      // 情况 3：双方都改了航线：暂停自动保存，本页航线与禁飞区草稿原样保留，
+      // 展示双方航线，由用户选择加载服务器航线或确认提交本页航线
+      presentRouteConflict(freshState, freshRev);
+      toast("航线在他页也被修改：已暂停自动保存，请选择处理方式");
+      renderPanel(); renderBoard(); runAnalyze(); renderNfzDraft();
+      throw new RouteConflictError();
+    }
+    throw new Error(r && r.error ? r.error : "工作区保存失败");
+  }
+  // 多轮合入仍被 409：保留本页全部编辑，不覆盖任何一方，提示稍后处理
+  toast("工作区在他处持续变更，本页编辑已保留，未保存：" + (lastErr?.error || "修订号冲突"));
+  throw new Error(lastErr?.error || "stale workspace");
 }
 async function saveStateNow() {
   clearTimeout(saveTimer);
@@ -114,63 +248,17 @@ async function saveStateNow() {
   // FIFO 队列保证不会与在途保存并发：后一个始终拿到前一个返回的修订号
   return enqueue(() => doSaveState());
 }
-async function doSaveState() {
-  // 已有发布时：航线编辑仍自动保存，但禁飞区变更只存草稿，
-  // 落库的禁飞区必须是已核准的 savedNfzs，不得顺带写入草稿内容；
-  // 并携带所见修订号：他页已变更（如别处刚核准）时不得静默覆盖
-  const published = !!currentRelease;
-  const payload = published ? { route: state.route, nfzs: savedNfzs } : state;
-  const headers = published ? { "X-Expected-Workspace-Rev": String(workspaceRev) } : {};
-  const res = await apiRaw("/api/state", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json", ...headers },
-    body: JSON.stringify(payload),
-  });
-  const r = await res.json().catch(() => ({}));
-  if (res.ok && r && typeof r.rev === "number") {
-    workspaceRev = r.rev;
-    if (!currentRelease) savedNfzs = clone(state.nfzs); // 未发布：整体落库，镜像同步
-    return;
-  }
-  if (res.status === 409 && r.reason === "stale") {
-    // 他页已变更：先取回最新工作区，合入他页已核准的禁飞区后带着本地航线重试一次；
-    // 本地禁飞区草稿保留，不被服务器内容冲掉
-    const fresh = await fetch("/api/state");
-    const freshRev = parseInt(fresh.headers.get("X-Workspace-Rev") || "0", 10) || workspaceRev;
-    const freshState = await fresh.json();
-    const localRoute = clone(state.route);
-    const localDraft = clone(state.nfzs);
-    savedNfzs = clone(freshState.nfzs || []);
-    workspaceRev = freshRev;
-    const retry = await apiRaw("/api/state", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json", "X-Expected-Workspace-Rev": String(workspaceRev) },
-      body: JSON.stringify({ route: localRoute, nfzs: savedNfzs }),
-    });
-    const rr = await retry.json().catch(() => ({}));
-    if (retry.ok && rr && typeof rr.rev === "number") {
-      workspaceRev = rr.rev;
-      state.route = localRoute;
-      state.nfzs = localDraft; // 草稿原样保留
-      toast("检测到他页已更新，已合入他页已核准的禁飞区，本页航线已保存");
-      renderPanel(); renderBoard(); runAnalyze(); renderNfzDraft();
-      return;
-    }
-    // 重试仍失败：放弃本地未落库改动，以服务器为准，冲突原因不再静默
-    applyLoadedState(freshState);
-    workspaceRev = freshRev;
-    savedNfzs = clone(state.nfzs);
-    toast("工作区在他页持续变更，已载入最新内容，请重新编辑：" + (rr.error || r.error || "修订号冲突"));
-    renderPanel(); fitView(); runAnalyze(); renderRelease(); renderNfzDraft();
-    throw new Error(rr.error || r.error || "stale workspace");
-  }
-  throw new Error(r && r.error ? r.error : "工作区保存失败");
-}
+
 function scheduleSave() {
+  // 双方航线冲突未解决期间暂停自动保存，避免任何一方航线被自动写库覆盖
+  if (routeConflict) return;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    enqueue(() => doSaveState().catch((e) => toast(e.message || "自动保存失败")));
+    enqueue(() => doSaveState().catch((e) => {
+      if (e instanceof RouteConflictError) return; // 冲突面板已提示，不再弹保存失败
+      toast(e.message || "自动保存失败");
+    }));
   }, 500);
 }
 function scheduleAnalyze() {
@@ -452,6 +540,80 @@ function renderResults() {
   box.innerHTML = html;
 }
 
+// ----------------------------------------------------------- 双页航线冲突
+// 409 分流发现“双方都改了航线”后：本页航线、禁飞区草稿与服务器最新航线
+// 三者都在页面保留，自动保存暂停，由用户二选一。选择任一项都不会清掉
+// 禁飞区草稿；确认提交始终用所见最新修订号做条件写入，再遇 409 时继续
+// 保留本页编辑并重新展示冲突，绝不被当成保存成功。
+function summarizeRoute(route) {
+  const wps = (route && route.waypoints) || [];
+  const names = wps.map((w) => w.name || "WP").join(" → ");
+  const parts = [`${wps.length} 个航点`];
+  if ((route && route.departureTime) || wps.length) {
+    parts.push(`起飞 ${(route && route.departureTime) || "—"}`);
+  }
+  parts.push(names || "（空航线）");
+  return parts.join(" ｜ ");
+}
+
+function renderRouteConflict() {
+  const box = $("#routeConflictBox");
+  if (!box) return;
+  if (!routeConflict) { box.innerHTML = ""; return; }
+  box.innerHTML = `<div class="conflict-card">
+    <div class="conflict-head">⚠ 双页航线冲突，自动保存已暂停</div>
+    <div class="summary">他页已先保存航线（工作区修订 ${routeConflict.rev}）。本页未保存航线、禁飞区草稿均已保留，请选择：</div>
+    <div class="conflict-side">
+      <b>本页航线（未保存）</b>
+      <div class="summary">${esc(summarizeRoute(state.route))}</div>
+    </div>
+    <div class="conflict-side">
+      <b>服务器最新航线（他页已保存）</b>
+      <div class="summary">${esc(summarizeRoute(routeConflict.route))}</div>
+    </div>
+    <div class="draft-actions">
+      <button id="btnConflictRemote">加载服务器航线</button>
+      <button id="btnConflictLocal" class="minor">确认提交本页航线</button>
+    </div>
+  </div>`;
+  $("#btnConflictRemote").onclick = chooseRemoteRoute;
+  $("#btnConflictLocal").onclick = confirmLocalRoute;
+}
+
+async function chooseRemoteRoute() {
+  if (!routeConflict) return;
+  // 仅切换本页航线为服务器最新：不发起写入（服务器本就是它），
+  // 禁飞区草稿原样保留（state.nfzs 不动），基线/修订号已在冲突发生时同步
+  state.route = clone(routeConflict.route);
+  serverRouteSeen = clone(routeConflict.route);
+  routeConflict = null;
+  if (selection.type === "wp") selection = { type: null, id: null };
+  renderRouteConflict();
+  renderPanel(); renderBoard(); runAnalyze(); renderNfzDraft();
+  toast("已加载服务器最新航线（禁飞区草稿保留），自动保存已恢复");
+}
+
+async function confirmLocalRoute() {
+  if (!routeConflict) return;
+  // 用所见最新修订号条件写入本页航线；再遇 409 时 doSaveState 会重新
+  // 分流：仅禁飞区被他页核准则合入，航线仍冲突则继续保留并再次提示
+  const rev = routeConflict.rev;
+  routeConflict = null;
+  renderRouteConflict();
+  try {
+    await enqueue(() => doSaveStateWith(rev));
+  } catch (e) {
+    if (e instanceof RouteConflictError) return; // 冲突面板已再次展示
+    toast(e.message || "提交失败");
+  }
+}
+
+// 以显式指定的“所见最新修订号”发起一次条件保存（其余同 doSaveState）
+async function doSaveStateWith(rev) {
+  workspaceRev = rev;
+  return doSaveState();
+}
+
 // ----------------------------------------------------------- 结构变更
 function afterStructuralChange() {
   renderBoard(); renderPanel(); scheduleAnalyze(); scheduleSave();
@@ -671,8 +833,22 @@ function renderRelease(err) {
 }
 
 async function publishVersion(v) {
-  // 先让在途航线自动保存落库（发布仍取当前工作区禁飞区），再在同一条串行队列里发布
-  await flushPendingSave();
+  // 先让在途航线自动保存落库（发布仍取当前工作区禁飞区），再在同一条串行队列里发布。
+  // 在途保存若落为未解决的双方航线冲突，不得继续发布。
+  if (routeConflict) {
+    toast("请先解决航线冲突，再发布航线");
+    return;
+  }
+  try {
+    await flushPendingSave();
+  } catch (e) {
+    if (e instanceof RouteConflictError) {
+      toast("航线自动保存与他页冲突，已暂停，请先选择处理方式，未继续发布");
+      return;
+    }
+    toast("自动保存未完成：" + (e.message || "保存失败") + "，未继续发布");
+    return;
+  }
   return enqueue(async () => {
     let r;
     try {
@@ -766,7 +942,22 @@ function renderNfzDraft(err) {
 // 草稿原样保留。核准操作本身不改变工作区航线或发布快照——通过时由服务端
 // 仅原子替换工作区禁飞区。
 async function submitNfzApproval() {
-  await flushPendingSave();
+  // 未解决的航线冲突不得被当成保存成功而继续核准：
+  // flush 期间若在途保存落为冲突（RouteConflictError），直接中止
+  if (routeConflict) {
+    toast("请先解决航线冲突，再提交禁飞区核准");
+    return;
+  }
+  try {
+    await flushPendingSave();
+  } catch (e) {
+    if (e instanceof RouteConflictError) {
+      toast("航线自动保存与他页冲突，已暂停，请先选择处理方式，未继续核准");
+      return;
+    }
+    toast("自动保存未完成：" + (e.message || "保存失败") + "，未继续核准");
+    return;
+  }
   return enqueue(() => doNfzApproval());
 }
 
@@ -793,12 +984,14 @@ async function doNfzApproval() {
   if (r.reason === "stale") {
     // 工作区修订号/发布号已变化：同步最新号与他页已核准禁飞区（草稿保留），再展示明细
     try {
-      const [sres, cur] = await Promise.all([fetch("/api/state"), api("/api/release")]);
-      const srev = parseInt(sres.headers.get("X-Workspace-Rev") || "0", 10) || workspaceRev;
-      const s = await sres.json();
+      const [relRes, stRes] = await Promise.all([api("/api/release"), fetch("/api/state")]);
+      const srev = parseInt(stRes.headers.get("X-Workspace-Rev") || "0", 10) || workspaceRev;
+      const fresh = await stRes.json();
       workspaceRev = srev;
-      savedNfzs = clone(s.nfzs || []); // 已核准基线以服务器为准，本页草稿不覆盖
-      if (cur && cur.ok) currentRelease = cur.release;
+      serverRouteSeen = clone(fresh.route || serverRouteSeen);
+      // 已核准基线以服务器为准：本页无草稿时画布一并采用，有草稿则只换基线、草稿不覆盖
+      adoptServerNfzs(fresh.nfzs || []);
+      if (relRes && relRes.ok) currentRelease = relRes.release;
     } catch (e) { /* 仍展示下方失败明细 */ }
     renderRelease();
   }
@@ -832,7 +1025,16 @@ async function loadVersions() {
       const full = await api(`/api/versions/${v.id}`);
       Object.assign(state, full.state);
       selection = { type: null, id: null };
-      await saveStateNow(); // 已有发布时仅落库航线，版本带来的禁飞区变化留作草稿
+      try {
+        await saveStateNow(); // 已有发布时仅落库航线，版本带来的禁飞区变化留作草稿
+      } catch (e) {
+        if (e instanceof RouteConflictError) {
+          renderPanel(); fitView(); runAnalyze();
+          toast("载入的航线与他页已保存航线冲突，已暂停自动保存，请选择加载或确认提交");
+          return;
+        }
+        toast("版本已载入，但自动保存失败：" + (e.message || "冲突"));
+      }
       renderPanel(); fitView(); runAnalyze();
       toast(currentRelease && nfzDraftDirty()
         ? `已载入版本 ${v.name}（禁飞区变化已存为草稿）` : "已载入版本 " + v.name);
