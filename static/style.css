@@ -140,6 +140,19 @@ input[type="checkbox"] { accent-color: #2f6df6; }
   border-radius: 5px; padding: 4px 10px; font-size: 12px; cursor: pointer;
 }
 .draft-actions button:hover { border-color: #5a7bb0; }
+
+/* 航线冲突 */
+.conflict-card {
+  background: rgba(255,159,67,.10); border: 1px solid #ff9f43;
+  border-radius: 7px; padding: 8px; margin-bottom: 10px;
+}
+.conflict-head { font-weight: 700; font-size: 12px; color: #ffb36b; margin-bottom: 4px; }
+.conflict-cols { display: flex; gap: 6px; margin-top: 6px; }
+.conflict-col { flex: 1; min-width: 0; background: #121b2c; border-radius: 5px; padding: 6px; }
+.conflict-col-head { font-size: 11px; color: #9fb0c9; margin-bottom: 4px; }
+.conflict-route { font-size: 11px; color: #d7e0ee; line-height: 1.6; word-break: break-all; }
+.route-server { fill: none; stroke: #ff9f43; stroke-width: 2.5; stroke-dasharray: 7 5; }
+.route-server-label { fill: #ffb36b; font-size: 12px; pointer-events: none; }
 .toast {
   position: fixed; top: 56px; left: 50%; transform: translateX(-50%);
   background: #1e2a40; border: 1px solid #3f557c; color: #d7e0ee;

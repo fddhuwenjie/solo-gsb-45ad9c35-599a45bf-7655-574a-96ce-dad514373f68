@@ -10,6 +10,11 @@
   重新提交成功；未携带该头时保持原“无条件保存”行为（未发布自动保存不回归）；
 - 双页面交错：A 页核准成功后，B 页的航线保存被拒绝且不会用 B 页缓存的
   旧禁飞区覆盖 A 页已核准内容；B 页核准也必须使用最新修订号；
+- 双页航线冲突：两页从同一修订号各改航线，后保存页 409 后——服务器航线
+  仍为本页编辑前所见（仅禁飞区他页获核准）时可合入已核准禁飞区条件重试；
+  双方都改了航线时不得换新号整份重试覆盖先保存页，须由用户确认后才以
+  所见最新修订号条件写入，再遇 409 不写库、本页编辑保留；冲突解决前
+  用旧修订号提交核准仍被拒；
 - 保存与核准相邻：保存先落库后，核准须用保存返回的新修订号（旧号 409）；
 - 核准通过/失败均不改写发布快照。
 """
@@ -239,6 +244,121 @@ class WorkspaceConcurrencyTests(unittest.TestCase):
                          {"expected": 1, "actual": 2})
         _, hdr_rev = self.get_state(self.page_b)
         self.assertEqual(hdr_rev, rev)
+
+    # —— 双页航线冲突：后保存页收到 409 后的处置协议 ——
+    def test_route_conflict_merge_when_only_nfzs_approved_elsewhere(self):
+        """服务器航线仍为本页编辑前所见（仅禁飞区他页获核准）→ 合入后条件重试。"""
+        _, rev = self.publish_route(self.page_a)
+        base_route = {"waypoints": []}  # 两页编辑前所见的工作区航线
+        # A 页仅核准禁飞区（不动航线），修订号 +1
+        r = self.approve(self.page_a, [clone(FAR_NFZ)], rev, 1)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        rev_a = r.get_json()["rev"]
+        # B 页改了航线、带着旧修订号保存 → 409，不写库（B 页草稿禁飞区也不落库）
+        route_b = clone(ROUTE)
+        route_b["waypoints"][0]["name"] = "B页航线"
+        r = self.put(self.page_b, {"route": route_b, "nfzs": []}, rev)
+        self.assertEqual(r.status_code, 409)
+        state, hdr_rev = self.get_state(self.page_b)
+        self.assertEqual(hdr_rev, rev_a)
+        self.assertEqual(state["route"], base_route)      # 409 未写入 B 页航线
+        self.assertEqual(state["nfzs"], [FAR_NFZ])        # A 页核准内容在
+        # B 页取回最新工作区：航线仍是 base_route（== 编辑前所见）→ 合入已核准
+        # 禁飞区，以最新修订号条件重试本页航线 → 通过，草稿不落库
+        rev_b = self.put_ok(self.page_b,
+                            {"route": route_b, "nfzs": [clone(FAR_NFZ)]}, rev_a)
+        state, hdr_rev = self.get_state(self.page_b)
+        self.assertEqual(hdr_rev, rev_b)
+        self.assertEqual(state["route"]["waypoints"][0]["name"], "B页航线")
+        self.assertEqual(state["nfzs"], [FAR_NFZ])        # 已核准内容未被草稿覆盖
+        # 发布快照不受自动保存影响
+        self.assertEqual(self.release_snapshot(self.page_b)["state"]["route"]["waypoints"],
+                         ROUTE["waypoints"])
+
+    def test_route_conflict_both_changed_no_silent_overwrite(self):
+        """双方都改了航线：后保存页不得换新号整份重试覆盖先保存页。"""
+        _, rev = self.publish_route(self.page_a)
+        route_a = clone(ROUTE)
+        route_a["waypoints"][0]["name"] = "A页航线"
+        route_b = clone(ROUTE)
+        route_b["waypoints"][0]["name"] = "B页航线"
+        # A 页先保存（条件写入），修订号推进
+        rev_a = self.put_ok(self.page_a, {"route": route_a, "nfzs": []}, rev)
+        # B 页后保存 → 409；服务器航线已是 A 页航线，与 B 页编辑前所见（空航线）不同
+        r = self.put(self.page_b, {"route": route_b, "nfzs": []}, rev)
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json()["details"]["workspaceRev"],
+                         {"expected": rev, "actual": rev_a})
+        # 关键回归：B 页不得自动整份重试——在用户确认前服务器仍是 A 页航线
+        state, hdr_rev = self.get_state(self.page_b)
+        self.assertEqual(hdr_rev, rev_a)
+        self.assertEqual(state["route"]["waypoints"][0]["name"], "A页航线")
+        # B 页用户确认提交本页航线：以所见最新修订号条件写入 → 成功（明确选择的覆盖）
+        rev_b = self.put_ok(self.page_b, {"route": route_b, "nfzs": []}, rev_a)
+        state, hdr_rev = self.get_state(self.page_b)
+        self.assertEqual(hdr_rev, rev_b)
+        self.assertEqual(state["route"]["waypoints"][0]["name"], "B页航线")
+        # 发布快照始终不动
+        self.assertEqual(self.release_snapshot(self.page_b)["state"]["route"]["waypoints"],
+                         ROUTE["waypoints"])
+
+    def test_route_conflict_confirm_submit_reconflict_keeps_edits(self):
+        """确认提交再遇 409：不写库、不递增修订号，重新取号后再确认才成功。"""
+        _, rev = self.publish_route(self.page_a)
+        route_a = clone(ROUTE)
+        route_a["waypoints"][0]["name"] = "A页航线"
+        route_a2 = clone(ROUTE)
+        route_a2["waypoints"][0]["name"] = "A页航线v2"
+        route_b = clone(ROUTE)
+        route_b["waypoints"][0]["name"] = "B页航线"
+        rev_a = self.put_ok(self.page_a, {"route": route_a, "nfzs": []}, rev)
+        # B 页后保存 → 409（此刻 B 页看到 rev_a 与 A 页航线）
+        r = self.put(self.page_b, {"route": route_b, "nfzs": []}, rev)
+        self.assertEqual(r.status_code, 409)
+        # A 页再次保存，修订号继续推进
+        rev_a2 = self.put_ok(self.page_a, {"route": route_a2, "nfzs": []}, rev_a)
+        # B 页按上一次所见修订号确认提交 → 再遇 409：不写库、不递增
+        r = self.put(self.page_b, {"route": route_b, "nfzs": []}, rev_a)
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json()["details"]["workspaceRev"],
+                         {"expected": rev_a, "actual": rev_a2})
+        state, hdr_rev = self.get_state(self.page_b)
+        self.assertEqual(hdr_rev, rev_a2)
+        self.assertEqual(state["route"]["waypoints"][0]["name"], "A页航线v2")
+        # B 页重新取到最新修订号后再确认 → 成功
+        rev_b = self.put_ok(self.page_b, {"route": route_b, "nfzs": []}, rev_a2)
+        state, hdr_rev = self.get_state(self.page_b)
+        self.assertEqual(hdr_rev, rev_b)
+        self.assertEqual(state["route"]["waypoints"][0]["name"], "B页航线")
+
+    def test_approval_rejected_until_route_conflict_resolved(self):
+        """航线冲突未解决时，旧修订号提交核准仍被拒；解决后携带新号才通过。"""
+        _, rev = self.publish_route(self.page_a)
+        route_a = clone(ROUTE)
+        route_a["waypoints"][0]["name"] = "A页航线"
+        route_b = clone(ROUTE)
+        route_b["waypoints"][0]["name"] = "B页航线"
+        rev_a = self.put_ok(self.page_a, {"route": route_a, "nfzs": []}, rev)
+        # B 页保存 409（航线冲突未解决）：用旧修订号提交核准 → 409，
+        # 不得被当成保存成功而继续核准；工作区禁飞区不被改动
+        r = self.put(self.page_b, {"route": route_b, "nfzs": []}, rev)
+        self.assertEqual(r.status_code, 409)
+        r = self.approve(self.page_b, [clone(FAR_NFZ)], rev, 1)
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json()["reason"], "stale")
+        state, hdr_rev = self.get_state(self.page_b)
+        self.assertEqual(hdr_rev, rev_a)
+        self.assertEqual(state["nfzs"], [])
+        # B 页解决冲突（确认提交本页航线）后，携带新修订号核准 → 通过，
+        # 仅替换工作区禁飞区，本页航线保留，发布快照不动
+        rev_b = self.put_ok(self.page_b, {"route": route_b, "nfzs": []}, rev_a)
+        r = self.approve(self.page_b, [clone(FAR_NFZ)], rev_b, 1)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        state, _ = self.get_state(self.page_b)
+        self.assertEqual(state["nfzs"], [FAR_NFZ])
+        self.assertEqual(state["route"]["waypoints"][0]["name"], "B页航线")
+        self.assertEqual(self.release_snapshot(self.page_b)["state"]["route"]["waypoints"],
+                         ROUTE["waypoints"])
 
     # —— 保存与核准相邻：顺序与修订号协调 ——
     def test_adjacent_save_then_approval_uses_new_rev(self):
